@@ -1,36 +1,73 @@
+# Builds a tagged release into the private registry r.tulz.dev.
+#
+# Diverged from upstream (which pushes kutt/kutt to Docker Hub) on 2026-09-19.
+# Changes, and why:
+#   - registry  -> secrets.REGISTRY_HOST (r.tulz.dev), image path follows the
+#     tulz-dev convention <registry>/<github.repository>, i.e.
+#     r.tulz.dev/negrienko/kutt. Deliberately NOT r.tulz.dev/commons/kutt:
+#     that path holds the old Gitea-built v2.7.4 image that is still deployed.
+#   - runs-on stays ubuntu-latest. The self-hosted `negrienko-runners` scale
+#     set is REPO-scoped to negrienko/blog and cannot serve this repo. This
+#     repo is public, so GitHub-hosted minutes are free, and r.tulz.dev is
+#     publicly reachable (174.138.14.22, answers 401 to an unauthenticated
+#     /v2/ probe), so a hosted runner can push to it.
+#   - platforms linux/amd64 only. Every node in the cluster is amd64; building
+#     arm64 under QEMU roughly doubled the build for an image nothing runs.
+#     QEMU setup dropped with it.
+#   - action versions brought up to what the tulz-dev service repos use.
+#   - workflow_dispatch added so a tag can be built on demand without cutting
+#     a GitHub Release first.
 name: docker-build-release
-
-env:
-  dockerhub_repository: "kutt/kutt"
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or ref to build (e.g. v3.2.6)"
+        required: true
+        default: "v3.2.6"
 
 jobs:
-  dockerhub-build-push:
+  registry-build-push:
+    name: Build and push to r.tulz.dev
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v2
-      -
-        name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
-      -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-      -
-        name: Login to DockerHub
-        uses: docker/login-action@v1 
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      -
-        name: Build and push
-        uses: docker/build-push-action@v2
+          ref: ${{ github.event.inputs.ref || github.event.release.tag_name }}
+
+      - name: Resolve version
+        id: v
+        run: |
+          REF="${{ github.event.inputs.ref || github.event.release.tag_name }}"
+          echo "version=${REF#v}" >> "$GITHUB_OUTPUT"
+          echo "building ${REF} -> ${REF#v}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to registry
+        uses: docker/login-action@v4
         with:
-          platforms: linux/amd64,linux/arm64
+          registry: ${{ secrets.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
           context: .
+          platforms: linux/amd64
           push: true
-          tags: ${{ env.dockerhub_repository }}:${{ github.event.release.tag_name }}, ${{ env.dockerhub_repository }}:latest
+          tags: |
+            ${{ secrets.REGISTRY_HOST }}/${{ github.repository }}:${{ steps.v.outputs.version }}
+            ${{ secrets.REGISTRY_HOST }}/${{ github.repository }}:latest
+          cache-from: type=registry,ref=${{ secrets.REGISTRY_HOST }}/${{ github.repository }}:latest
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
